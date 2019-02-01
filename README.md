@@ -66,10 +66,39 @@ We will be doing some initial data processing. To begin with, we will read in ea
 Once the data is processed we pickle it into `preprocessed_data.pkl`.
 
 
+For the model we are going to construct in this notebook we will construct a feature representation which is very similar to a bag of words feature representation. To start, we will represent each word as an integer. Of course, some of the words that appear in the reviews occur very infrequently and so likely don't contain much information for the purposes of sentiment analysis. The way we will deal with this problem is that we will fix the size of our working vocabulary and we will only include the words that appear most frequently. We will then combine all of the infrequent words into a single category and, in our case, we will label it as `1`. Since we will be using a recurrent neural network, it will be convenient if the length of each review is the same. To do this, we will fix a size for our reviews and then pad short reviews with the category 'no word' (which we will label `0`) and truncate long reviews. 
+
+To begin with, we need to construct a way to map words that appear in the reviews to integers. Here we fix the size of our vocabulary (including the 'no word' ('0') and 'infrequent' ('1') categories) to be `5000`.
+
+After creating the tokenized dictionary, `word_dict`, I notice the five most frequent tokenized words in the training set are movi, film, one, like, and time. It does make sense that these word would appear the most often because they are words that would be found in movie reviews but some really don't give great sentiment information. For this model I decided to just let it slide but if I wanted to improve the models success I might remove the top 2 from the dictionary because they could be over saturating the model.
+
+Next, we pickle the `word_dict` so we can us it in our future AWS Lambda function when turning a review into a integer reprasentation. Then we create a function that will be used to truncate the training reviews to a set padding value. I started with 500 as my reviews fixed length.
+
+The methods `build_dict` and `preprocess_data` are used to get the top 4998 words from the review dataset to reduce the processing speed but this also reduces accuracy of the model we're designing because of the loss of data when removing the other less frequent words.
+
+The method `convert_and_pad_data` is used to convert the the review words representation into the bag of words representation. If a 0 no word found in that space. If a 1 is found, it is an infrequent words, so a word not in our top 4998. If from 2-5000 if found, it is a frequent word. The lower the number, like 2, the more frequent the word is in the dataset. The higher the number, like 5000, the less frequent the word is int he dataset, but still frequent since its in the top 4998 of words in the dataset.
 
 
 ## Step 3. Upload the processed data to S3
 
+We start this step by saving the traing dataset to `train.csv`. 
+```python
+    pd.concat([pd.DataFrame(train_y), pd.DataFrame(train_X_len), pd.DataFrame(train_X)], axis=1).to_csv(os.path.join(data_dir, 'train.csv'), header=False, index=False)
+```
+
+Next, we need to upload the training data to the SageMaker default S3 bucket so that we can provide access to it while training our model.
+```python
+    import sagemaker
+
+    sagemaker_session = sagemaker.Session()
+
+    bucket = sagemaker_session.default_bucket()
+    prefix = 'sagemaker/sentiment_rnn'
+
+    role = sagemaker.get_execution_role()
+    
+    input_data = sagemaker_session.upload_data(path=data_dir, bucket=bucket, key_prefix=prefix)
+```
 
 
 # Results
