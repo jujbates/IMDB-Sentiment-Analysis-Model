@@ -21,7 +21,8 @@ Once the notebook is open you can simply run the notebook. The notebook will do 
 1. [Download or otherwise retrieve the data](#user-content-step-1-download-or-otherwise-retrieve-the-data)
 2. [Process and Prepare the data](#user-content-step-2-process-and-prepare-the-data)
 3. [Upload the processed data to S3](#user-content-step-3-upload-the-processed-data-to-s3)
-4. Train a chosen model.
+4. [Build and Train the PyTorch Model](#user-content-step-4-build-and-train-the-pytorch-model)
+
 5. Test the trained model (typically using a batch transform job).
 6. Deploy the trained model.
 7. Use the deployed model.
@@ -70,9 +71,9 @@ For the model we are going to construct in this notebook we will construct a fea
 
 To begin with, we need to construct a way to map words that appear in the reviews to integers. Here we fix the size of our vocabulary (including the 'no word' ('0') and 'infrequent' ('1') categories) to be `5000`.
 
-After creating the tokenized dictionary, `word_dict`, I notice the five most frequent tokenized words in the training set are movi, film, one, like, and time. It does make sense that these word would appear the most often because they are words that would be found in movie reviews but some really don't give great sentiment information. For this model I decided to just let it slide but if I wanted to improve the models success I might remove the top 2 from the dictionary because they could be over saturating the model.
+After creating the tokenized dictionary, `word_dict`, we notice the five most frequent tokenized words in the training set are movi, film, one, like, and time. It does make sense that these word would appear the most often because they are words that would be found in movie reviews but some really don't give great sentiment information. For this model we decided to just let it slide but if we wanted to improve the models success we might remove the top 2 from the dictionary because they could be over saturating the model.
 
-Next, we pickle the `word_dict` so we can us it in our future AWS Lambda function when turning a review into a integer reprasentation. Then we create a function that will be used to truncate the training reviews to a set padding value. I started with 500 as my reviews fixed length.
+Next, we pickle the `word_dict` so we can us it in our future AWS Lambda function when turning a review into a integer reprasentation. Then we create a function that will be used to truncate the training reviews to a set padding value. we started with 500 as my reviews fixed length.
 
 The methods `build_dict` and `preprocess_data` are used to get the top 4998 words from the review dataset to reduce the processing speed but this also reduces accuracy of the model we're designing because of the loss of data when removing the other less frequent words.
 
@@ -98,6 +99,86 @@ Next, we need to upload the training data to the SageMaker default S3 bucket so 
     role = sagemaker.get_execution_role()
     
     input_data = sagemaker_session.upload_data(path=data_dir, bucket=bucket, key_prefix=prefix)
+```
+
+## Step 4. Build and Train the PyTorch Model
+
+In the XGBoost notebook we discussed what a model is in the SageMaker framework. In particular, a model comprises three objects
+
+ - Model Artifacts,
+ - Training Code, and
+ - Inference Code,
+ 
+each of which interact with one another. In the XGBoost example we used training and inference code that was provided by Amazon. Here we will still be using containers provided by Amazon with the added benefit of being able to include our own custom code.
+
+
+We will start by implementing our own neural network in PyTorch along with a training script. For the purposes of this project we have provided the necessary model object in the `model.py` file, inside of the `train` folder. A model comprises three objects
+
+ - Model Artifacts,
+ - Training Code, and
+ - Inference Code,
+ 
+each of which interact with one another. We use training and inference code that is provided by Amazon. Here we will be using containers provided by Amazon with the added benefit of being able to include our own custom code. The `train/model.py` looks is defind as follows:
+
+```python
+    import torch.nn as nn
+
+    class LSTMClassifier(nn.Module):
+        """
+        This is the simple RNN model we will be using to perform Sentiment Analysis.
+        """
+
+        def __init__(self, embedding_dim, hidden_dim, vocab_size):
+            """
+            Initialize the model by settingg up the various layers.
+            """
+            super(LSTMClassifier, self).__init__()
+
+            self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=0)
+            self.lstm = nn.LSTM(embedding_dim, hidden_dim)
+            self.dense = nn.Linear(in_features=hidden_dim, out_features=1)
+            self.sig = nn.Sigmoid()
+
+            self.word_dict = None
+
+        def forward(self, x):
+            """
+            Perform a forward pass of our model on some input.
+            """
+            x = x.t()
+            lengths = x[0,:]
+            reviews = x[1:,:]
+            embeds = self.embedding(reviews)
+            lstm_out, _ = self.lstm(embeds)
+            out = self.dense(lstm_out)
+            out = out[lengths - 1, range(len(lengths))]
+            return self.sig(out.squeeze())
+```
+
+The important takeaway from the implementation provided is that there are three parameters that we may wish to tweak to improve the performance of our model. These are the embedding dimension, the hidden dimension and the size of the vocabulary. We have made these parameters configurable in the training script so that if we wish to modify them we do not need to modify the script itself. We wrote some of the training code in the notebook so that we can more easily diagnose any issues that arise.
+
+First we load a small portion of the training data set to use as a sample. It would be very time consuming to try and train the model completely in the notebook as we do not have access to a gpu and the compute instance that we are using is not particularly powerful. However, we were able to work on a small bit of the data to get a feel for how our training script is behaving.
+
+After setting a training dataloader, we wrote the training method. We made this training method as simple as possible just to get a feel for the dataloader, so all loading and parameter loading will be implemented later in the notebook. We test the training method with a small training set over 5 epoches just to make sure everything is working and on the right track.
+
+In order to construct a PyTorch model using SageMaker we must provide SageMaker with a training script. We may optionally include a directory which will be copied to the container and from which our training code will be run. When the training container is executed it will check the uploaded directory (if there is one) for a `requirements.txt` file and install any required Python libraries, after which the training script will be run.
+
+When a PyTorch model is constructed in SageMaker, an entry point must be specified. This is the Python file which will be executed when the model is trained. Inside of the `train` directory is a file called `train.py`, which contains the necessary code to train our model. The way that SageMaker passes hyperparameters to the training script is by way of arguments. These arguments can then be parsed and used in the training script. To see how this is done take a look at the provided `train/train.py` file.
+
+```python
+    from sagemaker.pytorch import PyTorch
+
+    estimator = PyTorch(entry_point="train.py",
+                        source_dir="train",
+                        role=role,
+                        framework_version='0.4.0',
+                        train_instance_count=1,
+                        train_instance_type='ml.p2.xlarge',
+                        hyperparameters={
+                            'epochs': 20,
+                            'hidden_dim': 200,
+                        })
+    estimator.fit({'training': input_data})
 ```
 
 
